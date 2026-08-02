@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "aegis-core",
+    "aegis-lists",
+    "aegisd",
+    "aegis-ctl",
+]
+default-members = ["aegisd", "aegis-ctl"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Aegis Contributors"]
+
+[workspace.dependencies]
+aegis-core = { path = "aegis-core" }
+aegis-lists = { path = "aegis-lists" }
+anyhow = "1"
+arc-swap = "1"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+fst = "0.4"
+hickory-client = "0.25"
+hickory-proto = "0.25"
+hickory-resolver = "0.25"
+hickory-server = "0.25"
+lru = "0.12"
+memmap2 = "0.9"
+parking_lot = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }

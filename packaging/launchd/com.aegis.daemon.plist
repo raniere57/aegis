@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.aegis.daemon</string>
+	<key>BundleProgram</key>
+	<string>Contents/Resources/aegisd</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/var/log/aegisd.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/aegisd.err</string>
+</dict>
+</plist>

@@ -1,0 +1,14 @@
+[package]
+name = "aegis-hotpath-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bench]]
+name = "bench_lookup"
+harness = false
+path = "bench_lookup.rs"
+
+[dependencies]
+aegis-core = { path = "../../daemon/aegis-core" }
+criterion = "0.5"

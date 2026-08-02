@@ -1,0 +1,25 @@
+# Example privileged / production-oriented config.
+# Dev mode writes ~/.aegis/config.toml automatically.
+
+[daemon]
+listen = ["127.0.0.1:53", "[::1]:53"]
+enabled = true
+
+[upstream]
+servers = ["1.1.1.1:53", "1.0.0.1:53"]
+timeout_ms = 1500
+max_inflight = 256
+
+[cache]
+size = 8192
+nxdomain_ttl_secs = 45
+
+[lists]
+auto_update = true
+interval_hours = 24
+urls = [
+  "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/hosts/multi.txt",
+]
+
+[allowlist]
+domains = []

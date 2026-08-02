@@ -1,0 +1,15 @@
+target/
+**/*.rs.bk
+.DS_Store
+*.swp
+.idea/
+.vscode/
+xcuserdata/
+DerivedData/
+.build/
+*.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/
+*.xcuserstate
+app/.build/
+*.app
+dist/
+.aegis-dev/

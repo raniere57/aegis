@@ -1,0 +1,334 @@
+//! Lightweight DNS53 proxy: allow → block → cache → upstream.
+
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use arc_swap::ArcSwap;
+use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
+use hickory_proto::rr::{Name, RecordType};
+use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
+use tokio::net::UdpSocket;
+use tokio::sync::Semaphore;
+use tracing::{debug, warn};
+
+use crate::cache::{CacheKey, DnsCache};
+use crate::config::Config;
+use crate::metrics::Metrics;
+use crate::normalize::{is_local_bypass, normalize_domain};
+use crate::trie::{Allowlist, Blocklist};
+
+pub struct FilterState {
+    pub blocklist: ArcSwap<Blocklist>,
+    pub allowlist: ArcSwap<Allowlist>,
+    pub domain_count: AtomicUsize,
+    pub list_updated_at_unix: AtomicUsize,
+    pub last_update_error: ArcSwap<Option<String>>,
+}
+
+impl FilterState {
+    pub fn new(blocklist: Blocklist, allowlist: Allowlist) -> Self {
+        let count = blocklist.len();
+        Self {
+            blocklist: ArcSwap::from_pointee(blocklist),
+            allowlist: ArcSwap::from_pointee(allowlist),
+            domain_count: AtomicUsize::new(count),
+            list_updated_at_unix: AtomicUsize::new(0),
+            last_update_error: ArcSwap::from_pointee(None),
+        }
+    }
+
+    pub fn swap_blocklist(&self, bl: Blocklist) {
+        let count = bl.len();
+        self.domain_count.store(count, Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as usize)
+            .unwrap_or(0);
+        self.list_updated_at_unix.store(now, Ordering::Relaxed);
+        self.blocklist.store(Arc::new(bl));
+    }
+}
+
+pub struct DnsProxy {
+    pub config: Arc<ArcSwap<Config>>,
+    pub metrics: Arc<Metrics>,
+    pub filter: Arc<FilterState>,
+    pub cache: Arc<DnsCache>,
+    inflight: Arc<Semaphore>,
+}
+
+impl DnsProxy {
+    pub fn new(
+        config: Arc<ArcSwap<Config>>,
+        metrics: Arc<Metrics>,
+        filter: Arc<FilterState>,
+    ) -> Self {
+        let cfg = config.load();
+        let cache = Arc::new(DnsCache::new(cfg.cache.size, cfg.cache.nxdomain_ttl_secs));
+        let inflight = Arc::new(Semaphore::new(cfg.upstream.max_inflight.max(1)));
+        Self {
+            config,
+            metrics,
+            filter,
+            cache,
+            inflight,
+        }
+    }
+
+    pub async fn run(self: Arc<Self>, addrs: Vec<SocketAddr>) -> anyhow::Result<()> {
+        let mut handles = Vec::new();
+        for addr in addrs {
+            let sock = Arc::new(UdpSocket::bind(addr).await?);
+            tracing::info!(%addr, "DNS UDP listening");
+            let this = Arc::clone(&self);
+            let sock_loop = Arc::clone(&sock);
+            handles.push(tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    match sock_loop.recv_from(&mut buf).await {
+                        Ok((n, peer)) => {
+                            let req = buf[..n].to_vec();
+                            let this2 = Arc::clone(&this);
+                            let sock2 = Arc::clone(&sock_loop);
+                            tokio::spawn(async move {
+                                if let Some(resp) = this2.handle_query(&req).await {
+                                    let _ = sock2.send_to(&resp, peer).await;
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "udp recv error");
+                        }
+                    }
+                }
+            }));
+
+            // TCP (RFC 7766) — length-prefixed messages
+            let this_tcp = Arc::clone(&self);
+            handles.push(tokio::spawn(async move {
+                let listener = match tokio::net::TcpListener::bind(addr).await {
+                    Ok(l) => {
+                        tracing::info!(%addr, "DNS TCP listening");
+                        l
+                    }
+                    Err(e) => {
+                        warn!(%addr, error = %e, "TCP bind failed");
+                        return;
+                    }
+                };
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        continue;
+                    };
+                    let this2 = Arc::clone(&this_tcp);
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut lenbuf = [0u8; 2];
+                        if stream.read_exact(&mut lenbuf).await.is_err() {
+                            return;
+                        }
+                        let len = u16::from_be_bytes(lenbuf) as usize;
+                        if len == 0 || len > 65535 {
+                            return;
+                        }
+                        let mut req = vec![0u8; len];
+                        if stream.read_exact(&mut req).await.is_err() {
+                            return;
+                        }
+                        if let Some(resp) = this2.handle_query(&req).await {
+                            let rlen = (resp.len() as u16).to_be_bytes();
+                            let _ = stream.write_all(&rlen).await;
+                            let _ = stream.write_all(&resp).await;
+                        }
+                    });
+                }
+            }));
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+        Ok(())
+    }
+
+    async fn handle_query(&self, bytes: &[u8]) -> Option<Vec<u8>> {
+        self.metrics.queries.fetch_add(1, Ordering::Relaxed);
+
+        let request = match Message::from_bytes(bytes) {
+            Ok(m) => m,
+            Err(e) => {
+                debug!(error = %e, "bad dns message");
+                return None;
+            }
+        };
+
+        if request.message_type() != MessageType::Query || request.op_code() != OpCode::Query {
+            return None;
+        }
+
+        let question = request.queries().first()?.clone();
+        let qname = question.name().to_string();
+        let domain = normalize_domain(&qname).unwrap_or_default();
+        let qtype = question.query_type();
+        let qclass = question.query_class();
+
+        let filtering = self.metrics.filtering.load(Ordering::Relaxed)
+            && self.config.load().daemon.enabled;
+
+        if filtering && !domain.is_empty() && !is_local_bypass(&domain) {
+            let allow = self.filter.allowlist.load();
+            if !allow.contains(&domain) {
+                let block = self.filter.blocklist.load();
+                if !block.is_empty() && block.contains(&domain) {
+                    self.metrics.blocked.fetch_add(1, Ordering::Relaxed);
+                    return Some(nxdomain_response(&request, &question));
+                }
+            }
+        }
+
+        let key = CacheKey {
+            name: domain.clone(),
+            qtype: u16::from(qtype),
+            qclass: u16::from(qclass),
+        };
+
+        if let Some(mut cached) = self.cache.get(&key) {
+            self.metrics.cache_hit.fetch_add(1, Ordering::Relaxed);
+            set_message_id(&mut cached, request.id());
+            return Some(cached);
+        }
+        self.metrics.cache_miss.fetch_add(1, Ordering::Relaxed);
+
+        let _permit = match self.inflight.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                self.metrics
+                    .upstream_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                return Some(servfail(&request));
+            }
+        };
+
+        match self.forward_upstream(bytes).await {
+            Some(resp_bytes) => {
+                self.metrics.upstream_ok.fetch_add(1, Ordering::Relaxed);
+                if let Ok(resp_msg) = Message::from_bytes(&resp_bytes) {
+                    let ttl = min_ttl(&resp_msg).unwrap_or(60);
+                    let is_nx = resp_msg.response_code() == ResponseCode::NXDomain;
+                    let mut store = resp_bytes.clone();
+                    set_message_id(&mut store, 0);
+                    self.cache.insert(key, store, ttl, is_nx);
+                }
+                let mut out = resp_bytes;
+                set_message_id(&mut out, request.id());
+                Some(out)
+            }
+            None => {
+                self.metrics
+                    .upstream_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                Some(servfail(&request))
+            }
+        }
+    }
+
+    async fn forward_upstream(&self, query: &[u8]) -> Option<Vec<u8>> {
+        let cfg = self.config.load();
+        let timeout = Duration::from_millis(cfg.upstream.timeout_ms.max(100));
+        for server in &cfg.upstream.servers {
+            let addr: SocketAddr = match server.parse() {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            match tokio::time::timeout(timeout, exchange_udp(addr, query)).await {
+                Ok(Ok(resp)) => return Some(resp),
+                Ok(Err(e)) => {
+                    debug!(server = %server, error = %e, "upstream error");
+                }
+                Err(_) => {
+                    debug!(server = %server, "upstream timeout");
+                }
+            }
+        }
+        None
+    }
+}
+
+async fn exchange_udp(addr: SocketAddr, query: &[u8]) -> std::io::Result<Vec<u8>> {
+    let bind = if addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let sock = UdpSocket::bind(bind).await?;
+    sock.connect(addr).await?;
+    sock.send(query).await?;
+    let mut buf = vec![0u8; 4096];
+    let n = sock.recv(&mut buf).await?;
+    buf.truncate(n);
+    Ok(buf)
+}
+
+fn set_message_id(msg: &mut [u8], id: u16) {
+    if msg.len() >= 2 {
+        msg[0] = (id >> 8) as u8;
+        msg[1] = id as u8;
+    }
+}
+
+fn nxdomain_response(
+    request: &Message,
+    question: &hickory_proto::op::Query,
+) -> Vec<u8> {
+    let mut msg = Message::new();
+    msg.set_id(request.id());
+    msg.set_message_type(MessageType::Response);
+    msg.set_op_code(OpCode::Query);
+    msg.set_response_code(ResponseCode::NXDomain);
+    msg.set_authoritative(true);
+    msg.set_recursion_available(true);
+    msg.set_recursion_desired(request.recursion_desired());
+    msg.add_query(question.clone());
+    msg.to_bytes().unwrap_or_default()
+}
+
+fn servfail(request: &Message) -> Vec<u8> {
+    let mut msg = Message::new();
+    msg.set_id(request.id());
+    msg.set_message_type(MessageType::Response);
+    msg.set_op_code(OpCode::Query);
+    msg.set_response_code(ResponseCode::ServFail);
+    msg.set_recursion_available(true);
+    msg.set_recursion_desired(request.recursion_desired());
+    for q in request.queries() {
+        msg.add_query(q.clone());
+    }
+    msg.to_bytes().unwrap_or_default()
+}
+
+fn min_ttl(msg: &Message) -> Option<u32> {
+    let mut min = None;
+    for rr in msg
+        .answers()
+        .iter()
+        .chain(msg.name_servers().iter())
+        .chain(msg.additionals().iter())
+    {
+        let ttl = rr.ttl();
+        min = Some(min.map_or(ttl, |m: u32| m.min(ttl)));
+    }
+    min
+}
+
+pub fn build_a_query(name: &str, id: u16) -> Vec<u8> {
+    let mut msg = Message::new();
+    msg.set_id(id);
+    msg.set_message_type(MessageType::Query);
+    msg.set_op_code(OpCode::Query);
+    msg.set_recursion_desired(true);
+    let n = Name::from_utf8(name).unwrap_or_else(|_| Name::root());
+    let q = hickory_proto::op::Query::query(n, RecordType::A);
+    msg.add_query(q);
+    msg.to_bytes().unwrap_or_default()
+}
