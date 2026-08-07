@@ -4,16 +4,27 @@
 set -euo pipefail
 
 APP="${AEGIS_APP:-/Applications/Aegis.app}"
-BIN="$APP/Contents/Resources/aegisd"
+SRC="$APP/Contents/Resources/aegisd"
 LABEL="com.aegis.daemon"
 PLIST="/Library/LaunchDaemons/${LABEL}.plist"
 
-if [[ ! -x "$BIN" ]]; then
-  echo "aegisd not found at $BIN" >&2
+if [[ ! -x "$SRC" ]]; then
+  echo "aegisd not found at $SRC" >&2
   exit 1
 fi
 
-codesign --force --sign - --identifier com.aegis.daemon "$BIN" 2>/dev/null || true
+# /Applications is mode 775 group admin, so launchd must not exec the daemon from inside the
+# app bundle: any admin-group process could overwrite the binary that runs as uid 0. Copy it
+# to a root:wheel directory instead. Not /Library/Application Support/Aegis — that is where
+# the daemon writes config and blocklist, and the root-exec'd binary must not sit in a
+# root-mutable data directory.
+DEST_DIR="/usr/local/libexec/aegis"
+install -d -o root -g wheel -m 755 "$DEST_DIR"
+install -o root -g wheel -m 755 "$SRC" "$DEST_DIR/aegisd"
+BIN="$DEST_DIR/aegisd"
+
+# Deliberately NOT re-signing here: `codesign --force --sign -` as root would launder a
+# swapped binary into a loadable one, which is the escalation step, not a mitigation.
 
 TMP="$(mktemp)"
 cat > "$TMP" <<EOF
@@ -31,6 +42,15 @@ cat > "$TMP" <<EOF
 	<true/>
 	<key>KeepAlive</key>
 	<true/>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>SoftResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>4096</integer>
+	</dict>
 	<key>StandardOutPath</key>
 	<string>/var/log/aegisd.log</string>
 	<key>StandardErrorPath</key>

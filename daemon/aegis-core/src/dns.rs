@@ -57,6 +57,9 @@ pub struct DnsProxy {
     pub filter: Arc<FilterState>,
     pub cache: Arc<DnsCache>,
     inflight: Arc<Semaphore>,
+    /// Index of the upstream that answered last. Without this, a silently dropped primary
+    /// costs a full timeout on every single cache miss, forever.
+    preferred_upstream: AtomicUsize,
 }
 
 impl DnsProxy {
@@ -74,6 +77,7 @@ impl DnsProxy {
             filter,
             cache,
             inflight,
+            preferred_upstream: AtomicUsize::new(0),
         }
     }
 
@@ -119,8 +123,16 @@ impl DnsProxy {
                     }
                 };
                 loop {
-                    let Ok((mut stream, _)) = listener.accept().await else {
-                        continue;
+                    // Never `continue` straight into accept() on error: under EMFILE this
+                    // busy-spins a core at 100%, violating the idle-CPU budget and starving
+                    // the UDP path. Back off instead.
+                    let (mut stream, _) = match listener.accept().await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!(%addr, error = %e, "TCP accept failed");
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
+                        }
                     };
                     let this2 = Arc::clone(&this_tcp);
                     tokio::spawn(async move {
@@ -236,13 +248,45 @@ impl DnsProxy {
     async fn forward_upstream(&self, query: &[u8]) -> Option<Vec<u8>> {
         let cfg = self.config.load();
         let timeout = Duration::from_millis(cfg.upstream.timeout_ms.max(100));
-        for server in &cfg.upstream.servers {
-            let addr: SocketAddr = match server.parse() {
-                Ok(a) => a,
-                Err(_) => continue,
-            };
+
+        // Parse once per call rather than once per attempt, and drop any upstream that points
+        // back at one of our own listeners — that would forward to ourselves, miss, take
+        // another permit, and forward again until every inflight permit is pinned at 100% CPU.
+        let listen: Vec<SocketAddr> = cfg
+            .daemon
+            .listen
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        let servers: Vec<(&String, SocketAddr)> = cfg
+            .upstream
+            .servers
+            .iter()
+            .filter_map(|s| s.parse().ok().map(|a| (s, a)))
+            .filter(|(s, a)| {
+                if listen.contains(a) {
+                    warn!(server = %s, "ignoring upstream that points at our own listener");
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+        if servers.is_empty() {
+            return None;
+        }
+
+        let start = self.preferred_upstream.load(Ordering::Relaxed) % servers.len();
+        for offset in 0..servers.len() {
+            let idx = (start + offset) % servers.len();
+            let (server, addr) = servers[idx];
             match tokio::time::timeout(timeout, exchange_udp(addr, query)).await {
-                Ok(Ok(resp)) => return Some(resp),
+                Ok(Ok(resp)) => {
+                    if offset != 0 {
+                        self.preferred_upstream.store(idx, Ordering::Relaxed);
+                    }
+                    return Some(resp);
+                }
                 Ok(Err(e)) => {
                     debug!(server = %server, error = %e, "upstream error");
                 }

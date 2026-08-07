@@ -42,7 +42,18 @@ pub async fn serve_control(
     tracing::info!(path = %paths.socket.display(), "control socket listening");
 
     loop {
-        let (stream, _) = listener.accept().await?;
+        // Returning here would kill the control server while the daemon keeps answering DNS.
+        // Rust does not unlink the socket path on drop, so the watchdog's `-S` test still
+        // passes, its probe gets ECONNREFUSED, and it rips DNS away from a healthy daemon.
+        // launchd's KeepAlive never fires either, because the process did not exit.
+        let (stream, _) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "control accept failed");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let paths = paths.clone();
         let config = Arc::clone(&config);
         let metrics = Arc::clone(&metrics);
@@ -308,10 +319,28 @@ fn patch_config(
         metrics.filtering.store(en, Ordering::Relaxed);
     }
     if let Some(servers) = params.pointer("/upstream/servers").and_then(|v| v.as_array()) {
-        cfg.upstream.servers = servers
-            .iter()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-            .collect();
+        // Reject the whole array on any bad entry. Silently filtering leaves the user with
+        // zero usable upstreams and no error, which reads as "DNS is broken" with no cause.
+        let mut parsed = Vec::with_capacity(servers.len());
+        for v in servers {
+            let s = v
+                .as_str()
+                .ok_or_else(|| "upstream.servers deve conter apenas strings".to_string())?;
+            let addr: std::net::SocketAddr = s
+                .parse()
+                .map_err(|_| format!("endereço de upstream inválido: {s} (use IP:porta)"))?;
+            // An upstream pointing at one of our own listeners makes every cache miss
+            // forward to ourselves until all inflight permits are pinned at 100% CPU —
+            // and patch_config persists it across reboots.
+            if cfg.daemon.listen.iter().any(|l| l.parse() == Ok(addr)) {
+                return Err(format!("{s} é o próprio Aegis; isso criaria um laço de DNS"));
+            }
+            parsed.push(s.to_string());
+        }
+        if parsed.is_empty() {
+            return Err("é preciso ao menos um servidor upstream".into());
+        }
+        cfg.upstream.servers = parsed;
     }
     if let Some(ms) = params.pointer("/upstream/timeout_ms").and_then(|v| v.as_u64()) {
         cfg.upstream.timeout_ms = ms;

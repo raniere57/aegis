@@ -79,10 +79,17 @@ final class SystemDNSManager {
         )
     }
 
+    /// Loopback addresses we install. Never let these into the backup: after a crash the
+    /// system DNS is already 127.0.0.1, and snapshotting that would make restoreDNS() *set*
+    /// loopback forever — inverting fail-open so every safety net kills the internet instead
+    /// of saving it. An all-empty snapshot restores to "Empty" (DHCP), which is correct both
+    /// here and on an ordinary DHCP Mac.
+    private static let loopbackServers: Set<String> = ["127.0.0.1", "::1"]
+
     func activateLocalDNS() throws {
         var services: [[String: Any]] = []
         for name in networkServices() {
-            let servers = currentDNS(for: name)
+            let servers = currentDNS(for: name).filter { !Self.loopbackServers.contains($0) }
             services.append(["name": name, "servers": servers])
         }
         let payload: [String: Any] = [

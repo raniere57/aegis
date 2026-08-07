@@ -10,6 +10,19 @@
 	<true/>
 	<key>KeepAlive</key>
 	<true/>
+	<!-- Interactive: a Standard daemon gets throttled under memory pressure, and every DNS
+	     query on the Mac waits behind this process. ThrottleInterval keeps a missing-binary
+	     crash loop from respawning every 10s into an unrotated log. The fd limit matters
+	     because each upstream query binds a fresh socket. -->
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>SoftResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>4096</integer>
+	</dict>
 	<key>StandardOutPath</key>
 	<string>/var/log/aegisd.log</string>
 	<key>StandardErrorPath</key>

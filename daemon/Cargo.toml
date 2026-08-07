@@ -6,7 +6,7 @@ members = [
     "aegisd",
     "aegis-ctl",
 ]
-default-members = ["aegisd", "aegis-ctl"]
+
 
 [workspace.package]
 version = "0.1.0"

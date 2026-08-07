@@ -14,7 +14,7 @@ pub enum ConfigError {
     TomlSer(#[from] toml::ser::Error),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub daemon: DaemonConfig,
@@ -78,7 +78,13 @@ fn default_listen_dev() -> Vec<String> {
     vec!["127.0.0.1:53553".into()]
 }
 fn default_upstreams() -> Vec<String> {
-    vec!["1.1.1.1:53".into(), "1.0.0.1:53".into()]
+    // Keep at least one IPv6 literal: on an IPv6-only / NAT64 network there is no IPv4 route,
+    // so an all-IPv4 list makes every cache miss SERVFAIL with no diagnosis.
+    vec![
+        "1.1.1.1:53".into(),
+        "1.0.0.1:53".into(),
+        "[2606:4700:4700::1111]:53".into(),
+    ]
 }
 fn default_timeout() -> u64 {
     1500
@@ -102,18 +108,6 @@ fn default_list_urls() -> Vec<String> {
         "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/multi-onlydomains.txt"
             .into(),
     ]
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            daemon: DaemonConfig::default(),
-            upstream: UpstreamConfig::default(),
-            cache: CacheConfig::default(),
-            lists: ListsConfig::default(),
-            allowlist: AllowlistConfig::default(),
-        }
-    }
 }
 
 impl Default for DaemonConfig {

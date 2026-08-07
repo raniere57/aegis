@@ -189,13 +189,24 @@ impl Updater {
             .domain_count
             .load(std::sync::atomic::Ordering::Relaxed);
         let new_count = all.len();
-        // Only refuse a shrink when a fetch actually failed. If every list downloaded fine,
-        // the upstream really did get smaller — otherwise one dead URL freezes updates forever.
+        // Every URL can answer 200 and still yield nothing parseable — a captive-portal HTML
+        // interstitial, or a format the parser does not recognize. fetch_errors is 0 in that
+        // case, so this floor must NOT be gated on it: without it we write an empty FST, clear
+        // last_update_error, and report a clean update while the filter is silently a no-op.
+        if new_count == 0 && prev_count > 0 {
+            bail!(
+                "as {} lista(s) baixaram, mas nenhum domínio foi reconhecido; \
+                 mantendo a blocklist anterior ({prev_count} domínios).",
+                urls.len()
+            );
+        }
+        // A large shrink with no failed download is a real upstream change and is adopted.
+        // Gated on fetch_errors so one dead URL cannot freeze updates forever.
         if fetch_errors > 0 && prev_count > 100 && new_count * 2 < prev_count {
             bail!(
-                "{fetch_errors} of {} lists failed to download, so the rebuilt list is too small \
-                 ({new_count} < 50% of previous {prev_count}); keeping previous. Check each list's \
-                 error in Ajustes → Listas.",
+                "{fetch_errors} de {} lista(s) falharam ao baixar, então a lista reconstruída \
+                 ficou pequena demais ({new_count} < 50% dos {prev_count} anteriores); \
+                 mantendo a anterior. Veja o erro de cada lista em Ajustes → Listas.",
                 urls.len()
             );
         }
