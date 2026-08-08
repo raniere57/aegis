@@ -27,6 +27,8 @@ apps do Mac
 
 Domínio bloqueado recebe `NXDOMAIN` — o app que pediu simplesmente não encontra o servidor de anúncios. Bloquear um domínio bloqueia todos os subdomínios dele.
 
+Bloquear pelo nome perguntado não basta: trackers se escondem atrás de um CNAME de primeira parte (`metrics.site.com` → `tracker.exemplo.net`). O Aegis também checa a cadeia de CNAME da resposta antes de entregá-la.
+
 A interface é só um cliente: fala com o daemon por um Unix socket, um JSON por linha.
 
 ```
@@ -42,7 +44,16 @@ MenuBarExtra  ──socket──►  aegisd (LaunchDaemon)
 
 Uma blocklist séria tem milhões de domínios. Guardar isso como `Vec<String>` custaria centenas de MB de RAM em um processo que fica ligado o dia inteiro.
 
-O Aegis compila a lista em um [FST](https://docs.rs/fst) (autômato finito determinístico) e faz `mmap` do arquivo. As páginas ficam no cache de arquivos do sistema, não no heap do processo — o RSS fica perto do working set, não do tamanho total. Na prática: **~15 MB de RSS com 3,4 milhões de domínios**.
+O Aegis compila a lista em um [FST](https://docs.rs/fst) (autômato finito determinístico) e faz `mmap` do arquivo. As páginas ficam no cache de arquivos do sistema, não no heap do processo — o RSS fica perto do working set, não do tamanho total.
+
+Medido de verdade, não estimado:
+
+| Cenário | RSS do `aegisd` |
+|---|---|
+| Lista default (~180k domínios), em repouso | **~2 MB** |
+| HaGeZi Ultimate (3,4M domínios), após 5.000 queries | **~23 MB** |
+
+Os 23 MB são quase todos páginas do FST tocadas pelas consultas — memória limpa e respaldada por arquivo, que o sistema recupera sob pressão sem swap. O [docs/BUDGET.md](docs/BUDGET.md) ainda diz "≤ 15 MB com 3,4M"; isso é uma meta, não uma medição, e a meta não está sendo cumprida.
 
 Trocar de lista usa `ArcSwap`: a lista nova é montada em paralelo e entra com um swap de ponteiro atômico. Nenhuma query trava durante a atualização.
 
@@ -59,13 +70,35 @@ Um filtro de DNS quebrado não deixa você com anúncios. Deixa você **sem inte
 | Camada | O que faz |
 |---|---|
 | Daemon | Blocklist ausente, corrompida ou vazia → encaminha tudo em vez de bloquear |
-| App | Detecta daemon morto no boot, ao sair e a cada 5 s → restaura o DNS |
+| App (liveness) | Detecta daemon morto no boot, ao sair e a cada 5 s → restaura o DNS |
+| App (resolução) | 25 falhas seguidas de upstream com o DNS em loopback → restaura. Estar vivo não é estar saudável: o daemon pode responder `status` perfeitamente com a internet morta |
 | LaunchAgent | Watchdog a cada 30 s: se o DNS aponta para o Aegis e o daemon não responde → restaura |
 | Script | [`restore-dns.sh`](packaging/scripts/restore-dns.sh) — botão de pânico manual |
+| Desinstalação | [`uninstall.sh`](packaging/scripts/uninstall.sh) restaura o DNS **antes** de remover qualquer coisa |
 
 O DNS anterior é salvo em `dns-backup.json` antes de qualquer alteração. Perder o bloqueio por um tempo é sempre melhor que perder a internet.
 
-Também existe um guard contra listas que encolhem: se o rebuild vier com menos de 50% dos domínios anteriores **e algum download tiver falhado**, a lista antiga é mantida. Uma URL morta não derruba seu bloqueio.
+Também existe um guard contra listas que encolhem: se o rebuild vier com menos de 50% dos domínios anteriores **e algum download tiver falhado**, a lista antiga é mantida. Uma URL morta não derruba seu bloqueio. E se todas as listas baixarem com 200 OK mas nenhuma linha for reconhecida — o caso do portal cativo devolvendo HTML — a lista anterior também é mantida, em vez de gravar um filtro vazio e reportar sucesso.
+
+---
+
+## Instalação
+
+Baixe o `.dmg` mais recente em [Releases](https://github.com/raniere57/aegis/releases), arraste o Aegis para `/Applications` e então:
+
+```bash
+sudo bash /Applications/Aegis.app/Contents/Resources/install-launchdaemon.sh
+```
+
+Esse passo é obrigatório e não é opcional-por-conveniência: ele copia o `aegisd` para `/usr/local/libexec/aegis` (`root:wheel`, modo 755) e aponta o LaunchDaemon para lá. `/Applications` é modo 775 do grupo `admin`, então um daemon executado de dentro do bundle poderia ser substituído por qualquer processo seu e reexecutado como uid 0 no próximo boot.
+
+Como o build é ad-hoc, o Gatekeeper reclama na primeira abertura — clique direito → **Abrir**.
+
+Para desinstalar:
+
+```bash
+sudo bash /Applications/Aegis.app/Contents/Resources/uninstall.sh
+```
 
 ---
 
@@ -142,6 +175,14 @@ Diretórios úteis: [hagezi/dns-blocklists](https://github.com/hagezi/dns-blockl
 
 ---
 
+## "Por que isso parou de funcionar?"
+
+A aba **Bloqueios** mostra os últimos domínios bloqueados, mais recentes primeiro, com contagem de repetições — e um botão **Permitir** que joga o domínio na allowlist na hora.
+
+É um ring buffer de 256 slots no daemon, 35 KB fixos, sem disco. Nada de histórico de navegação persistido: o que passou dos 256 últimos bloqueios desaparece, e reiniciar o daemon zera. Um filtro de DNS que grava tudo que você acessa é um problema de privacidade, não um recurso.
+
+---
+
 ## Uso pelo terminal
 
 O `aegis-ctl` fala o mesmo protocolo que a interface:
@@ -205,7 +246,9 @@ O daemon roda como root para escutar na porta 53. Isso significa que o socket de
 
 - O socket é `0660`, dono `root`, grupo `admin`. Contas standard, apps sandboxed e daemons de terceiros não alcançam.
 - **Ainda não há verificação de credencial do processo que conecta.** Qualquer processo rodando como um usuário administrador pode controlar o daemon. Um `LOCAL_PEERCRED` por uid seria o próximo passo.
-- As respostas do upstream ainda não têm o transaction ID validado antes de entrar no cache. O socket é `connect()`ado, então o kernel filtra por IP e porta de origem, mas isso não substitui a checagem.
+- O daemon recusa upstreams que apontem para os próprios listeners dele (laço infinito) e URLs de lista que não sejam `https://` — root busca essas URLs.
+- Respostas do upstream só entram no cache com o transaction ID batendo com o da pergunta e o bit QR ligado. O socket também é `connect()`ado, então o kernel já descarta datagramas de outra origem.
+- O binário privilegiado fica em `/usr/local/libexec/aegis` (`root:wheel`), fora do bundle gravável pelo grupo `admin`. O instalador **não** re-assina nada como root: `codesign --force --sign -` com privilégio transformaria um binário trocado em um binário carregável, que é o passo da escalada, não a mitigação.
 
 Achou algo? Abra uma issue.
 

@@ -370,6 +370,12 @@ impl DnsProxy {
 }
 
 async fn exchange_udp(addr: SocketAddr, query: &[u8]) -> std::io::Result<Vec<u8>> {
+    if query.len() < 12 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "query shorter than a DNS header",
+        ));
+    }
     let bind = if addr.is_ipv4() {
         "0.0.0.0:0"
     } else {
@@ -379,9 +385,21 @@ async fn exchange_udp(addr: SocketAddr, query: &[u8]) -> std::io::Result<Vec<u8>
     sock.connect(addr).await?;
     sock.send(query).await?;
     let mut buf = vec![0u8; 4096];
-    let n = sock.recv(&mut buf).await?;
-    buf.truncate(n);
-    Ok(buf)
+    // connect() makes the kernel drop datagrams from any other source, but a late reply from a
+    // *previous* exchange on a recycled port would still land here and get cached under the
+    // wrong name. Match the transaction ID and require an actual response (QR=1).
+    loop {
+        let n = sock.recv(&mut buf).await?;
+        if n < 12 {
+            continue;
+        }
+        let same_txid = buf[0] == query[0] && buf[1] == query[1];
+        let is_response = buf[2] & 0x80 != 0;
+        if same_txid && is_response {
+            buf.truncate(n);
+            return Ok(buf);
+        }
+    }
 }
 
 fn set_message_id(msg: &mut [u8], id: u16) {
