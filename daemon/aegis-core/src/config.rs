@@ -159,12 +159,22 @@ impl Config {
         Ok(toml::from_str(&text)?)
     }
 
+    /// Write atomically. `fs::write` truncates in place, so a crash or a SIGKILL — which the
+    /// installer delivers via `launchctl kickstart -k` — during a save leaves a half-written
+    /// or empty config, and the daemon then refuses to start while DNS still points at us.
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
+        use std::io::Write;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let text = toml::to_string_pretty(self)?;
-        fs::write(path, text)?;
+        let tmp = path.with_extension("toml.tmp");
+        {
+            let mut f = fs::File::create(&tmp)?;
+            f.write_all(text.as_bytes())?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, path)?;
         Ok(())
     }
 

@@ -24,6 +24,7 @@ cp "$ROOT/daemon/target/release/aegisd" "$APP/Contents/Resources/aegisd"
 cp "$ROOT/daemon/target/release/aegis-ctl" "$APP/Contents/Resources/aegis-ctl"
 cp "$ROOT/packaging/scripts/aegis-failopen.sh" "$APP/Contents/Resources/aegis-failopen.sh"
 cp "$ROOT/packaging/scripts/install-launchdaemon.sh" "$APP/Contents/Resources/install-launchdaemon.sh"
+cp "$ROOT/packaging/scripts/uninstall.sh" "$APP/Contents/Resources/uninstall.sh"
 cp "$ROOT/app/Aegis/Resources/Info.plist" "$APP/Contents/Info.plist"
 cp "$ROOT/packaging/launchd/com.aegis.daemon.plist" "$APP/Contents/Library/LaunchDaemons/"
 cp "$ROOT/packaging/launchd/com.aegis.failopen.plist" "$APP/Contents/Library/LaunchAgents/"
@@ -32,7 +33,8 @@ chmod +x "$APP/Contents/MacOS/Aegis" \
          "$APP/Contents/Resources/aegisd" \
          "$APP/Contents/Resources/aegis-ctl" \
          "$APP/Contents/Resources/aegis-failopen.sh" \
-         "$APP/Contents/Resources/install-launchdaemon.sh"
+         "$APP/Contents/Resources/install-launchdaemon.sh" \
+         "$APP/Contents/Resources/uninstall.sh"
 
 codesign --force --sign - --identifier com.aegis.daemon "$APP/Contents/Resources/aegisd"
 codesign --force --sign - --identifier com.aegis.ctl "$APP/Contents/Resources/aegis-ctl"

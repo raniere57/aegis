@@ -36,7 +36,9 @@ struct Args {
     listen: Option<String>,
 }
 
-#[tokio::main]
+// Two workers: this workload never saturates more than a couple of cores, and capping them
+// avoids touching a per-core stack plus cross-core task migration on the hot path.
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -54,6 +56,10 @@ async fn main() -> Result<()> {
 
     let config_path = args.config.unwrap_or_else(|| paths.config.clone());
     let mut config = Config::load(&config_path).context("load config")?;
+    // Only persist when we actually changed something. Config has no deny_unknown_fields, so
+    // an unconditional save rewrites the file through this version's schema on every boot and
+    // silently drops any key a future (or older) version wrote.
+    let mut config_changed = false;
     if !args.dev && args.listen.is_none() {
         // Prefer privileged ports when not in --dev, unless config already customized.
         if config.daemon.listen.len() == 1
@@ -61,6 +67,7 @@ async fn main() -> Result<()> {
                 || config.daemon.listen[0].ends_with(":53553"))
         {
             config = config.with_privileged_listen();
+            config_changed = true;
         }
     }
     if let Some(listen) = args.listen {
@@ -69,8 +76,11 @@ async fn main() -> Result<()> {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
+        config_changed = true;
     }
-    config.save(&config_path)?;
+    if config_changed {
+        config.save(&config_path)?;
+    }
 
     let filtering = config.daemon.enabled;
     let metrics = Arc::new(Metrics::new(filtering));

@@ -12,12 +12,15 @@ struct SettingsView: View {
             ListsSettingsView()
                 .tabItem { Label("Listas", systemImage: "list.bullet") }
                 .tag(1)
+            RecentBlocksView()
+                .tabItem { Label("Bloqueios", systemImage: "shield.lefthalf.filled") }
+                .tag(2)
             AllowlistSettingsView()
                 .tabItem { Label("Allowlist", systemImage: "checkmark.seal") }
-                .tag(2)
+                .tag(3)
             AdvancedSettingsView()
                 .tabItem { Label("Avançado", systemImage: "wrench") }
-                .tag(3)
+                .tag(4)
         }
         .frame(minWidth: 520, minHeight: 420)
         .environmentObject(state)

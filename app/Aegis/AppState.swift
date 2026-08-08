@@ -105,9 +105,9 @@ final class AppState: ObservableObject {
     }
 
     func refresh() async {
-        // Fail-open BEFORE probing UI state — broken DNS must not linger.
-        failOpenIfDaemonDown(reason: "Daemon offline — DNS restaurado para não quebrar a internet.")
-
+        // No pre-flight ping: status() below is itself the reachability probe, and the catch
+        // branch runs the same fail-open. The old extra ping was a blocking socket round-trip
+        // on the main actor every 5 seconds.
         do {
             let status = try await client.status()
             connected = true
@@ -116,7 +116,9 @@ final class AppState: ObservableObject {
             version = status.version
 
             // Heal: user wants filter (or daemon still marked on) but DNS was released by fail-open.
+            var healed = false
             if status.enabled && status.filtering && !dnsManager.isPointingToLocal() {
+                healed = true
                 if filterDesired {
                     do {
                         try dnsManager.activateLocalDNS()
@@ -130,7 +132,8 @@ final class AppState: ObservableObject {
                 }
             }
 
-            let status2 = (try? await client.status()) ?? status
+            // Only re-read when the branch above actually flipped the daemon's flags.
+            let status2 = healed ? ((try? await client.status()) ?? status) : status
             enabled = status2.enabled
             filtering = status2.filtering
 
@@ -143,6 +146,24 @@ final class AppState: ObservableObject {
             let metrics = try await client.metrics()
             queries = metrics.queries
             blocked = metrics.blocked
+
+            // Liveness is not health: the daemon can answer `status` perfectly while every
+            // upstream is unreachable, and then the Mac points at 127.0.0.1 with no working
+            // resolver. 25 failures in a row with nothing succeeding is not a blip.
+            if metrics.consecutiveUpstreamFailures >= 25 && dnsManager.isPointingToLocal() {
+                dnsManager.restoreDNS()
+                _ = try? await client.setEnabled(false)
+                systemDNSActive = false
+                dnsEffective = false
+                enabled = false
+                filtering = false
+                lastError = "O Aegis não conseguiu resolver nada nas últimas "
+                    + "\(metrics.consecutiveUpstreamFailures) consultas. DNS restaurado para "
+                    + "não deixar você sem internet. Verifique os servidores upstream em "
+                    + "Ajustes → Avançado."
+                statusLine = formatStatus()
+                return
+            }
             daemonServiceStatus = serviceManager.statusLabel()
         } catch {
             connected = false
@@ -244,6 +265,7 @@ final class AppState: ObservableObject {
         listUpdateMessage = "Baixando e compilando listas…"
         let before = listUpdatedAt
         let beforeCount = domainCount
+        let beforeError = lastError
         defer { listUpdating = false }
         do {
             _ = try await client.updateLists()
@@ -258,7 +280,10 @@ final class AppState: ObservableObject {
                 if i == 5 {
                     listUpdateMessage = "Ainda atualizando (listas grandes demoram)…"
                 }
-                if let err = lastError, err.contains("list") || err.contains("HTTP") || err.contains("failed") {
+                // Any error the daemon raised since we started belongs to this update. Matching
+                // English substrings missed every Portuguese message the updater now emits, so
+                // a failed update just sat on "Baixando…" until the 90s timeout.
+                if let err = lastError, err != beforeError {
                     listUpdateMessage = "Falhou: \(err)"
                     return
                 }

@@ -36,8 +36,17 @@ pub async fn serve_control(
     {
         use std::os::unix::fs::PermissionsExt;
         const ADMIN_GID: u32 = 80;
-        let _ = std::os::unix::fs::chown(&paths.socket, None, Some(ADMIN_GID));
-        let _ = std::fs::set_permissions(&paths.socket, std::fs::Permissions::from_mode(0o660));
+        // Do not swallow these: if the chown fails but the chmod lands, the socket ends up
+        // 0660 root:wheel, the GUI can never connect, and the watchdog reads that as a dead
+        // daemon and rips DNS away — while this function goes on to log "listening".
+        if let Err(e) = std::os::unix::fs::chown(&paths.socket, None, Some(ADMIN_GID)) {
+            tracing::warn!(error = %e, "could not set control socket group to admin; the GUI may not be able to connect");
+        }
+        if let Err(e) =
+            std::fs::set_permissions(&paths.socket, std::fs::Permissions::from_mode(0o660))
+        {
+            tracing::warn!(error = %e, "could not restrict control socket permissions");
+        }
     }
     tracing::info!(path = %paths.socket.display(), "control socket listening");
 
@@ -79,7 +88,10 @@ async fn handle_client(
     cache: Arc<DnsCache>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    // Cap the request: `lines()` grows a String until it sees a newline, so a peer that
+    // writes without one makes this root process allocate without bound. The largest real
+    // request is a patch_config carrying the allowlist, nowhere near 64 KiB.
+    let mut lines = BufReader::new(tokio::io::AsyncReadExt::take(reader, 64 * 1024)).lines();
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
             continue;
@@ -196,9 +208,11 @@ async fn dispatch(
             let Some(domain) = req.params.get("domain").and_then(|v| v.as_str()) else {
                 return Response::err(id, "bad_request", "missing domain");
             };
-            mutate_allowlist(paths, config, filter, |a| {
+            if let Err(e) = mutate_allowlist(paths, config, filter, |a| {
                 a.insert(domain);
-            });
+            }) {
+                return Response::err(id, "io", e);
+            }
             let domains = filter.allowlist.load().list();
             Response::ok(id, json!({"domains": domains}))
         }
@@ -206,11 +220,32 @@ async fn dispatch(
             let Some(domain) = req.params.get("domain").and_then(|v| v.as_str()) else {
                 return Response::err(id, "bad_request", "missing domain");
             };
-            mutate_allowlist(paths, config, filter, |a| {
+            if let Err(e) = mutate_allowlist(paths, config, filter, |a| {
                 a.remove(domain);
-            });
+            }) {
+                return Response::err(id, "io", e);
+            }
+            // A previously-blocked name may sit in the cache as an NXDOMAIN we synthesized,
+            // and removing an allow entry must not keep serving the old positive answer.
+            cache.clear();
             let domains = filter.allowlist.load().list();
             Response::ok(id, json!({"domains": domains}))
+        }
+        "recent.blocked" => {
+            let limit = req
+                .params
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(50)
+                .min(256) as usize;
+            Response::ok(
+                id,
+                json!({"entries": filter.recent.snapshot(limit)}),
+            )
+        }
+        "recent.clear" => {
+            filter.recent.clear();
+            Response::ok(id, json!({"cleared": true}))
         }
         "allowlist.list" => {
             let domains = filter.allowlist.load().list();
@@ -220,11 +255,18 @@ async fn dispatch(
             let Some(url) = req.params.get("url").and_then(|v| v.as_str()) else {
                 return Response::err(id, "bad_request", "missing url");
             };
+            // root fetches this URL; plain http would let anyone on the path choose what the
+            // machine resolves.
+            if !url.starts_with("https://") || url.len() > 2048 {
+                return Response::err(id, "bad_request", "a URL precisa começar com https://");
+            }
             let mut cfg = (**config.load()).clone();
             if !cfg.lists.urls.iter().any(|u| u == url) {
                 cfg.lists.urls.push(url.to_string());
             }
-            let _ = cfg.save(&paths.config);
+            if let Err(e) = cfg.save(&paths.config) {
+                return Response::err(id, "io", format!("não foi possível salvar: {e:#}"));
+            }
             config.store(Arc::new(cfg));
             Response::ok(id, lists_payload(paths, config, filter))
         }
@@ -234,7 +276,9 @@ async fn dispatch(
             };
             let mut cfg = (**config.load()).clone();
             cfg.lists.urls.retain(|u| u != url);
-            let _ = cfg.save(&paths.config);
+            if let Err(e) = cfg.save(&paths.config) {
+                return Response::err(id, "io", format!("não foi possível salvar: {e:#}"));
+            }
             config.store(Arc::new(cfg));
             Response::ok(id, lists_payload(paths, config, filter))
         }
@@ -295,15 +339,20 @@ fn mutate_allowlist(
     config: &Arc<ArcSwap<Config>>,
     filter: &Arc<FilterState>,
     f: impl FnOnce(&mut Allowlist),
-) {
+) -> Result<(), String> {
     let mut allow = (**filter.allowlist.load()).clone();
     f(&mut allow);
     let domains = allow.list();
-    filter.allowlist.store(Arc::new(allow));
     let mut cfg = (**config.load()).clone();
     cfg.allowlist.domains = domains;
-    let _ = cfg.save(&paths.config);
+    // Persist BEFORE publishing. A silent save failure used to leave the change live in memory
+    // and gone after the next restart: the user allowlists their bank, sees it work, and it is
+    // blocked again on reboot with no trace of why.
+    cfg.save(&paths.config)
+        .map_err(|e| format!("não foi possível salvar a allowlist: {e:#}"))?;
+    filter.allowlist.store(Arc::new(allow));
     config.store(Arc::new(cfg));
+    Ok(())
 }
 
 fn patch_config(

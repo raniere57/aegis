@@ -8,6 +8,10 @@ pub struct Metrics {
     pub cache_miss: AtomicU64,
     pub upstream_ok: AtomicU64,
     pub upstream_errors: AtomicU64,
+    /// Reset to 0 on every successful upstream answer. A daemon that is alive on the control
+    /// socket but cannot resolve anything is indistinguishable from a healthy one over `ping`,
+    /// and that is exactly the state where the user's DNS points at us and the internet is dead.
+    pub consecutive_upstream_failures: AtomicU64,
     pub started_at_unix: AtomicU64,
     pub filtering: AtomicBool,
 }
@@ -38,6 +42,9 @@ impl Metrics {
             cache_miss: self.cache_miss.load(Ordering::Relaxed),
             upstream_ok: self.upstream_ok.load(Ordering::Relaxed),
             upstream_errors: self.upstream_errors.load(Ordering::Relaxed),
+            consecutive_upstream_failures: self
+                .consecutive_upstream_failures
+                .load(Ordering::Relaxed),
             uptime_secs: now.saturating_sub(started),
             filtering: self.filtering.load(Ordering::Relaxed),
         }
@@ -52,6 +59,7 @@ pub struct MetricsSnapshot {
     pub cache_miss: u64,
     pub upstream_ok: u64,
     pub upstream_errors: u64,
+    pub consecutive_upstream_failures: u64,
     pub uptime_secs: u64,
     pub filtering: bool,
 }

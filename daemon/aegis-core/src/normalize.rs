@@ -32,11 +32,6 @@ pub fn is_local_bypass(domain: &str) -> bool {
         || domain == "local"
 }
 
-/// Split into labels left-to-right: `ads.example.com` → ["ads","example","com"]
-pub fn labels(domain: &str) -> Vec<&str> {
-    domain.split('.').filter(|l| !l.is_empty()).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

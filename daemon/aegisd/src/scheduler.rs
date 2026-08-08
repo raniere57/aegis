@@ -25,7 +25,7 @@ pub fn spawn_auto_update(config: Arc<ArcSwap<Config>>, updater: Arc<Updater>) {
                 jitter_secs,
                 "next auto-update scheduled"
             );
-            tokio::time::sleep(sleep_for).await;
+            sleep_until_wall_clock(sleep_for).await;
             let urls = config.load().lists.urls.clone();
             if !config.load().lists.auto_update {
                 continue;
@@ -34,6 +34,45 @@ pub fn spawn_auto_update(config: Arc<ArcSwap<Config>>, updater: Arc<Updater>) {
             info!(?outcome, "auto-update finished");
         }
     });
+}
+
+/// tokio's timer runs on a monotonic clock that macOS freezes while the machine sleeps, so a
+/// plain `sleep(24h)` on a laptop that is closed every night can take days of real time to fire.
+/// Wake often and compare against the wall clock instead.
+async fn sleep_until_wall_clock(total: Duration) {
+    const TICK: Duration = Duration::from_secs(60);
+    let deadline = std::time::SystemTime::now() + total;
+    loop {
+        let remaining = match deadline.duration_since(std::time::SystemTime::now()) {
+            Ok(d) => d,
+            Err(_) => return, // deadline already passed (or the clock jumped forward)
+        };
+        if remaining.is_zero() {
+            return;
+        }
+        tokio::time::sleep(remaining.min(TICK)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn wall_clock_sleep_returns_after_the_requested_span() {
+        let started = std::time::Instant::now();
+        sleep_until_wall_clock(Duration::from_millis(150)).await;
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        // Must not round up to the 60s tick.
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn zero_and_past_deadlines_return_immediately() {
+        let started = std::time::Instant::now();
+        sleep_until_wall_clock(Duration::ZERO).await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 }
 
 fn fastrand_u64(min: u64, max_inclusive: u64) -> u64 {

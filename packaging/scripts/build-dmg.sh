@@ -45,6 +45,7 @@ cp "$LIPO_DIR/aegisd" "$APP/Contents/Resources/aegisd"
 cp "$LIPO_DIR/aegis-ctl" "$APP/Contents/Resources/aegis-ctl"
 cp "$ROOT/packaging/scripts/aegis-failopen.sh" "$APP/Contents/Resources/aegis-failopen.sh"
 cp "$ROOT/packaging/scripts/install-launchdaemon.sh" "$APP/Contents/Resources/install-launchdaemon.sh"
+cp "$ROOT/packaging/scripts/uninstall.sh" "$APP/Contents/Resources/uninstall.sh"
 cp "$ROOT/app/Aegis/Resources/Info.plist" "$APP/Contents/Info.plist"
 cp "$ROOT/app/Aegis/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 cp "$ROOT/packaging/launchd/com.aegis.daemon.plist" "$APP/Contents/Library/LaunchDaemons/"
@@ -53,7 +54,8 @@ chmod +x "$APP/Contents/MacOS/Aegis" \
          "$APP/Contents/Resources/aegisd" \
          "$APP/Contents/Resources/aegis-ctl" \
          "$APP/Contents/Resources/aegis-failopen.sh" \
-         "$APP/Contents/Resources/install-launchdaemon.sh"
+         "$APP/Contents/Resources/install-launchdaemon.sh" \
+         "$APP/Contents/Resources/uninstall.sh"
 
 # Sign nested binaries first, then the bundle (adhoc). Avoid linker-signed-only aegisd → launchd EX_CONFIG.
 # No --deep: it re-signs nested code and overwrites the identifiers set just above with a

@@ -25,6 +25,7 @@ struct DaemonMetrics: Decodable {
     let cacheMiss: UInt64
     let upstreamOk: UInt64
     let upstreamErrors: UInt64
+    let consecutiveUpstreamFailures: UInt64
 
     enum CodingKeys: String, CodingKey {
         case queries, blocked
@@ -32,6 +33,7 @@ struct DaemonMetrics: Decodable {
         case cacheMiss = "cache_miss"
         case upstreamOk = "upstream_ok"
         case upstreamErrors = "upstream_errors"
+        case consecutiveUpstreamFailures = "consecutive_upstream_failures"
     }
 }
 
@@ -52,6 +54,13 @@ struct ListSourceStat {
     let domainCount: Int
     let lastSuccessUnix: Int?
     let lastError: String?
+}
+
+struct RecentBlock: Identifiable {
+    let domain: String
+    let atUnix: Int
+    let hits: Int
+    var id: String { domain }
 }
 
 struct ListsInfo {
@@ -155,6 +164,25 @@ final class DaemonClient: @unchecked Sendable {
         )
     }
 
+    func recentBlocked(limit: Int = 50) async throws -> [RecentBlock] {
+        let raw: [String: Any] = try await call(method: "recent.blocked", params: ["limit": limit])
+        let rows = raw["entries"] as? [[String: Any]] ?? []
+        return rows.compactMap { row in
+            guard let domain = row["domain"] as? String else { return nil }
+            return RecentBlock(
+                domain: domain,
+                atUnix: row["at_unix"] as? Int ?? 0,
+                hits: row["hits"] as? Int ?? 1
+            )
+        }
+    }
+
+    @discardableResult
+    func recentClear() async throws -> Bool {
+        let raw: [String: Any] = try await call(method: "recent.clear", params: [:])
+        return raw["cleared"] as? Bool ?? true
+    }
+
     func listsAdd(_ url: String) async throws {
         let _: [String: Any] = try await call(method: "lists.add_url", params: ["url": url])
     }
@@ -248,6 +276,13 @@ final class DaemonClient: @unchecked Sendable {
         guard fd >= 0 else { throw POSIXError(.ECONNREFUSED) }
         defer { close(fd) }
 
+        // Without these the read below blocks forever if the daemon accepts and then stalls
+        // (it holds no lock across a list compile today, but a wedged daemon must not wedge the
+        // UI too — every status tick would pile up on a global queue thread).
+        var tv = timeval(tv_sec: 15, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
         let pathBytes = socketPath.utf8CString
@@ -285,9 +320,10 @@ final class DaemonClient: @unchecked Sendable {
             collected.append(contentsOf: buffer[0..<n])
             if collected.contains(0x0A) { break }
         }
-        if let idx = collected.firstIndex(of: 0x0A) {
-            collected = Data(collected.prefix(upTo: idx))
-        }
-        return collected
+        // No newline means the peer closed (or timed out) mid-response; surfacing that as an
+        // error is what lets the caller fall through to the next candidate socket instead of
+        // failing on a JSON parse of a truncated object.
+        guard let idx = collected.firstIndex(of: 0x0A) else { throw POSIXError(.ETIMEDOUT) }
+        return Data(collected.prefix(upTo: idx))
     }
 }

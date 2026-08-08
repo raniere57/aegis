@@ -22,7 +22,21 @@ final class SystemDNSManager {
         backupURL = base.appendingPathComponent("dns-backup.json")
     }
 
+    /// The set of network services changes only when hardware is plugged in or a VPN adapter is
+    /// installed, but this was re-spawning `networksetup` on every 5s status tick. Cache it.
+    private var servicesCache: (at: Date, names: [String])?
+    private static let servicesCacheTTL: TimeInterval = 60
+
     func networkServices() -> [String] {
+        if let c = servicesCache, Date().timeIntervalSince(c.at) < Self.servicesCacheTTL {
+            return c.names
+        }
+        let names = fetchNetworkServices()
+        servicesCache = (Date(), names)
+        return names
+    }
+
+    private func fetchNetworkServices() -> [String] {
         let out = run("/usr/sbin/networksetup", ["-listallnetworkservices"]) ?? ""
         return out
             .split(separator: "\n")
@@ -87,6 +101,8 @@ final class SystemDNSManager {
     private static let loopbackServers: Set<String> = ["127.0.0.1", "::1"]
 
     func activateLocalDNS() throws {
+        // Writing DNS must cover an interface plugged in seconds ago, so never trust the cache.
+        servicesCache = nil
         var services: [[String: Any]] = []
         for name in networkServices() {
             let servers = currentDNS(for: name).filter { !Self.loopbackServers.contains($0) }
@@ -106,6 +122,7 @@ final class SystemDNSManager {
     }
 
     func restoreDNS() {
+        servicesCache = nil
         guard let data = try? Data(contentsOf: backupURL),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let services = obj["services"] as? [[String: Any]]
@@ -157,21 +174,33 @@ final class SystemDNSManager {
         _ = run("/usr/bin/killall", ["-HUP", "mDNSResponder"])
     }
 
+    /// Returns stdout+stderr, or nil if the process could not be launched or exited non-zero.
+    /// The autoreleasepool + explicit close matter: this runs several times per 5s status tick,
+    /// and without them each call leaks roughly 3.4 KB of Foundation objects and one file
+    /// descriptor pair, which is what grew the app to hundreds of MB over a day.
     @discardableResult
     private func run(_ launchPath: String, _ args: [String]) -> String? {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: launchPath)
-        task.arguments = args
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = pipe
-        do {
-            try task.run()
-            task.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            return String(data: data, encoding: .utf8)
-        } catch {
-            return nil
+        autoreleasepool {
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: launchPath)
+            task.arguments = args
+            let pipe = Pipe()
+            task.standardOutput = pipe
+            task.standardError = pipe
+            do {
+                try task.run()
+                // Read before waiting: a child that fills the 64 KB pipe buffer blocks forever
+                // if we wait for exit first. networksetup output is small today, but this is
+                // the kind of deadlock that only shows up on the machine with 30 interfaces.
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                task.waitUntilExit()
+                try? pipe.fileHandleForReading.close()
+                try? pipe.fileHandleForWriting.close()
+                guard task.terminationStatus == 0 else { return nil }
+                return String(data: data, encoding: .utf8)
+            } catch {
+                return nil
+            }
         }
     }
 }

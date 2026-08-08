@@ -18,7 +18,7 @@ nxdomain_ttl_secs = 45
 auto_update = true
 interval_hours = 24
 urls = [
-  "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/hosts/multi.txt",
+  "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/multi-onlydomains.txt",
 ]
 
 [allowlist]

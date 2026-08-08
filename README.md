@@ -174,6 +174,14 @@ DNS quebrado e a interface não abre:
 
 Restaura o DNS de todas as interfaces a partir do backup e limpa o cache. Funciona com o daemon morto.
 
+Desinstalar de vez (restaura o DNS antes de remover qualquer coisa):
+
+```bash
+sudo bash /Applications/Aegis.app/Contents/Resources/uninstall.sh
+```
+
+Adicione `--purge` para apagar também config, blocklist e logs.
+
 Ver o que o daemon está fazendo:
 
 ```bash
@@ -189,7 +197,7 @@ tail -f /var/log/aegisd.log
 - **Sem DoH de saída.** O upstream é DNS53 puro, então seu provedor vê quais domínios você resolve.
 - **Sem Network Extension.** Um `NEDNSProxyProvider` seria mais robusto que mexer no `networksetup`, mas exige conta paga de desenvolvedor Apple.
 - **Sem assinatura/notarização.** Build ad-hoc: o Gatekeeper reclama na primeira abertura (clique direito → Abrir).
-- **Apagar o Aegis.app com o filtro ligado deixa o DNS órfão.** Os dois LaunchDaemons apontam para dentro do bundle. Desligue o filtro antes de desinstalar, ou rode o `restore-dns.sh`.
+- **Arrastar o Aegis.app para o lixo não desinstala.** O daemon vive em `/usr/local/libexec/aegis` e continua rodando, mas o watchdog de fail-open some junto com o bundle. Use [`uninstall.sh`](packaging/scripts/uninstall.sh), que restaura o DNS antes de remover qualquer coisa.
 
 ## Segurança
 

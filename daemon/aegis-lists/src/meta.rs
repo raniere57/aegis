@@ -21,6 +21,9 @@ impl ListMetaDb {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path).context("open meta.sqlite")?;
+        // A metadata write can land while a list compile is still holding the DB; without a
+        // busy handler that surfaces as SQLITE_BUSY and the per-list error is lost.
+        conn.busy_timeout(std::time::Duration::from_secs(3))?;
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS list_sources (
@@ -67,8 +70,11 @@ impl ListMetaDb {
             INSERT INTO list_sources (url, etag, last_modified, last_success_unix, last_error, domain_count)
             VALUES (?1, ?2, ?3, ?4, NULL, ?5)
             ON CONFLICT(url) DO UPDATE SET
-                etag = excluded.etag,
-                last_modified = excluded.last_modified,
+                -- COALESCE, not assignment: a 304 refetch carries no validators, and
+                -- overwriting a good ETag with NULL permanently disables conditional
+                -- fetching for that list (and cascades to the others next cycle).
+                etag = COALESCE(excluded.etag, list_sources.etag),
+                last_modified = COALESCE(excluded.last_modified, list_sources.last_modified),
                 last_success_unix = excluded.last_success_unix,
                 last_error = NULL,
                 domain_count = excluded.domain_count

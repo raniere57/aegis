@@ -7,6 +7,7 @@ pub mod ipc;
 pub mod metrics;
 pub mod normalize;
 pub mod paths;
+pub mod recent;
 pub mod trie;
 
 pub use cache::DnsCache;

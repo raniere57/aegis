@@ -9,7 +9,6 @@ pub struct AegisPaths {
     pub config: PathBuf,
     pub blocklist: PathBuf,
     pub meta_db: PathBuf,
-    pub dns_backup: PathBuf,
     pub socket: PathBuf,
 }
 
@@ -35,7 +34,6 @@ impl AegisPaths {
             config: root.join("config.toml"),
             blocklist: root.join("blocklist.bin"),
             meta_db: root.join("meta.sqlite"),
-            dns_backup: root.join("dns-backup.json"),
             socket,
             root,
         }
