@@ -24,8 +24,16 @@ final class SMAppServiceManager {
     func registerIfNeeded() throws {
         let classic = "/Library/LaunchDaemons/com.aegis.daemon.plist"
         if FileManager.default.fileExists(atPath: classic) {
-            // Already on the reliable path — don't fight it with SMAppService.
+            // Already on the reliable path — don't fight it with SMAppService. Standing aside is
+            // not enough, though: if an SMAppService registration still owns the label, launchd
+            // keeps honoring IT, and it points at the executable inside the app bundle. The
+            // classic plist then sits on disk being ignored while a months-old binary serves
+            // DNS, and every installer that only checks "is a pid running" reports success.
             if #available(macOS 13.0, *) {
+                let daemon = SMAppService.daemon(plistName: "\(Self.daemonPlistName).plist")
+                if daemon.status == .enabled || daemon.status == .requiresApproval {
+                    try? daemon.unregister()
+                }
                 try? registerFailOpenAgent()
             }
             return

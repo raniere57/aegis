@@ -59,9 +59,25 @@ cat > "$TMP" <<EOF
 </plist>
 EOF
 
-# Tear down SMAppService-managed or previous job if present
+# Tear down whatever is holding the label. This MUST be verified, not hoped for: when the job
+# was registered by SMAppService the launchd record lives in the smd domain, `bootout` fails,
+# and a later `kickstart` happily restarts the OLD executable inside the app bundle. That is
+# how a machine ends up running a binary from weeks ago while this script prints "OK".
 launchctl bootout "system/${LABEL}" 2>/dev/null || true
 rm -f "$PLIST"
+
+# Give launchd a moment, then make sure nothing is still holding port 53.
+for _ in $(seq 1 20); do
+  pgrep -f '[a]egisd' >/dev/null 2>&1 || break
+  sleep 0.25
+done
+if pgrep -f '[a]egisd' >/dev/null 2>&1; then
+  echo "==> processo aegisd antigo ainda vivo; encerrando"
+  pkill -f '[a]egisd' 2>/dev/null || true
+  sleep 1
+  pkill -9 -f '[a]egisd' 2>/dev/null || true
+  sleep 1
+fi
 
 cp "$TMP" "$PLIST"
 chmod 644 "$PLIST"
@@ -72,14 +88,25 @@ launchctl enable "system/${LABEL}"
 launchctl kickstart -k "system/${LABEL}"
 
 sleep 2
-if launchctl print "system/${LABEL}" 2>/dev/null | grep -q 'pid ='; then
-  echo "OK: aegisd running via classic LaunchDaemon"
-  launchctl print "system/${LABEL}" 2>/dev/null | egrep 'pid =|state =|last exit|path =' | head -10
-  exit 0
+
+# Validate that the RUNNING pid is the binary we just installed. Checking only for the presence
+# of a pid is what made the previous version of this script report success while an orphaned
+# copy from the app bundle served DNS.
+PID="$(launchctl print "system/${LABEL}" 2>/dev/null | awk -F'= ' '/^\tpid = /{print $2; exit}')"
+if [[ -n "${PID:-}" ]]; then
+  RUNNING="$(ps -o comm= -p "$PID" 2>/dev/null || true)"
+  if [[ "$RUNNING" == "$BIN" ]]; then
+    echo "OK: aegisd (pid $PID) rodando a partir de $BIN"
+    exit 0
+  fi
+  echo "ERRO: o label ${LABEL} está rodando o pid $PID a partir de:" >&2
+  echo "        ${RUNNING:-<desconhecido>}" >&2
+  echo "      esperado: $BIN" >&2
+  echo "      Um registro do SMAppService provavelmente está vencendo o plist clássico." >&2
+  echo "      Abra o Aegis, desmarque 'Iniciar no login' em Ajustes -> Avançado e rode isto de novo." >&2
+  exit 1
 fi
 
-# Still failed — surface status
-echo "WARN: kickstart finished but pid not found" >&2
+echo "ERRO: nenhum processo subiu para ${LABEL}" >&2
 launchctl print "system/${LABEL}" 2>/dev/null | egrep 'state =|last exit|job state|path =' | head -15 || true
-ps -ax | grep '[a]egisd' || true
 exit 1

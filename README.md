@@ -234,6 +234,7 @@ tail -f /var/log/aegisd.log
 ## Limitações conhecidas
 
 - **VPNs vencem.** Se a VPN impõe o DNS dela, a query nunca chega ao Aegis. A interface detecta e avisa, mas não tem como contornar — filtro local só vê o que passa pela máquina. É por isso que o NextDNS funciona com VPN e o Aegis não: eles filtram na nuvem.
+- **iCloud Private Relay passa por cima de tudo.** Se você assina o iCloud+, ele vem ligado e faz o Safari resolver nomes por Oblivious DoH direto para a Apple — a query nunca chega em `127.0.0.1` e o Aegis não vê nada. Sintoma clássico: o `dig` bloqueia normalmente, mas um teste de adblock no navegador dá quase 0%. Desligue em Ajustes do Sistema → Apple Account → iCloud → Retransmissão Privada.
 - **DNS-over-HTTPS no navegador também passa por cima.** Chrome e Firefox fazem DoH por conta própria. Desative nas configurações do navegador.
 - **Sem DoH de saída.** O upstream é DNS53 puro, então seu provedor vê quais domínios você resolve.
 - **Sem Network Extension.** Um `NEDNSProxyProvider` seria mais robusto que mexer no `networksetup`, mas exige conta paga de desenvolvedor Apple.
